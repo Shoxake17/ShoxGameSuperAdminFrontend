@@ -1,0 +1,125 @@
+name: CI/CD & Security Scan - ShoxGame Super Admin
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * *' # Boshqa adminlardan keyinroq ishlaydi
+
+jobs:
+  # 1. Semgrep — SAST (Xavfsizlik tahlili)
+  semgrep_sast:
+    name: SAST - Semgrep Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        run: |
+          docker run --rm -v $(pwd):/src returntocorp/semgrep semgrep scan \
+            --config=p/owasp-top-ten \
+            --config=p/secrets \
+            --config=p/react \
+            --config=p/typescript \
+            --error \
+            --output=semgrep.sarif --sarif . || true
+
+      - name: Check for Critical Vulnerabilities
+        run: |
+          CRITICAL=$(jq '[.runs[].results[] | select(.level == "error")] | length' semgrep.sarif)
+          echo "🔴 Critical Security Issues: $CRITICAL"
+          if [ "$CRITICAL" -gt 0 ]; then exit 1; fi
+
+  # 2. SonarCloud — Code Quality
+  sonarcloud:
+    name: Code Quality - SonarCloud
+    runs-on: ubuntu-latest
+    needs: semgrep_sast
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v5.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.organization=shoxake17
+            -Dsonar.projectKey=ShoxGameSuperAdmin
+            -Dsonar.sources=src
+            -Dsonar.host.url=https://sonarcloud.io
+
+  # 3. Build and Push to GHCR
+  build-and-push:
+    name: Build and Push Docker
+    runs-on: ubuntu-latest
+    needs: [semgrep_sast] 
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      - name: Build and Push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          # Imaj nomini Super Admin'ga o'zgartirdik
+          tags: ghcr.io/shoxake17/shoxgamesuperadmin:latest
+          no-cache: true
+          build-args: |
+            VITE_BACKEND_URL=${{ secrets.VITE_SUPER_BACKEND_URL }}
+            VITE_SUPER_KEY=${{ secrets.VITE_SUPER_SECRET_KEY }}
+
+  # 4. Deploy to Server
+  deploy:
+    name: Deploy to Production VPS
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            # Super Admin uchun alohida papka
+            mkdir -p ~/shoxpro/frontend/shoxgamesuperadmin
+            cd ~/shoxpro/frontend/shoxgamesuperadmin
+            
+            echo ${{ secrets.GHCR_PAT }} | docker login ghcr.io -u shoxake17 --password-stdin
+            
+            # Yangi Super Admin imajini tortish
+            docker pull ghcr.io/shoxake17/shoxgamesuperadmin:latest
+            
+            # Konteynerni yangilash (Eski docker-compose up -d --force-recreate)
+            docker compose up -d --force-recreate || docker-compose up -d --force-recreate
+            
+            # Keraksiz eski imajlarni o'chirish
+            docker image prune -f
+
+  # 5. DAST — OWASP ZAP
+  zap_scan:
+    name: DAST - OWASP ZAP Scan
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    steps:
+      - name: Run ZAP Scan
+        uses: zaproxy/action-full-scan@v0.12.0
+        with:
+          # Super Admin domeni
+          target: 'https://super-admin.shoxpro.uz'
+          artifact_name: 'zap-super-admin-report'
